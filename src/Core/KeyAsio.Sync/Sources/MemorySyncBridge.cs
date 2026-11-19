@@ -10,7 +10,7 @@ public class MemorySyncBridge
 {
     private readonly GameSyncSourceCoordinator _sourceCoordinator;
     private readonly StableMemoryGameSyncSource _stableSource;
-    private readonly LazerIpcBridge _lazerIpcBridge;
+    private readonly LazerIpcGameSyncSource _lazerSource;
     private readonly SyncSessionContext _syncSessionContext;
     private readonly AppSettings _appSettings;
     private readonly ILogger<MemorySyncBridge> _logger;
@@ -21,14 +21,14 @@ public class MemorySyncBridge
     public MemorySyncBridge(
         GameSyncSourceCoordinator sourceCoordinator,
         StableMemoryGameSyncSource stableSource,
-        LazerIpcBridge lazerIpcBridge,
+        LazerIpcGameSyncSource lazerSource,
         SyncSessionContext syncSessionContext,
         AppSettings appSettings,
         ILogger<MemorySyncBridge> logger)
     {
         _sourceCoordinator = sourceCoordinator;
         _stableSource = stableSource;
-        _lazerIpcBridge = lazerIpcBridge;
+        _lazerSource = lazerSource;
         _syncSessionContext = syncSessionContext;
         _appSettings = appSettings;
         _logger = logger;
@@ -41,7 +41,7 @@ public class MemorySyncBridge
 
         _appSettings.Sync.Scanning.PropertyChanged += OnScanningSettingsChanged;
         _appSettings.Sync.PropertyChanged += OnSyncSettingsChanged;
-        _lazerIpcBridge.ChannelConnectionChanged += OnLazerIpcChannelConnectionChanged;
+        _lazerSource.AvailabilityChanged += OnLazerAvailabilityChanged;
 
         ConfigureStableSourceIntervals();
 
@@ -69,11 +69,11 @@ public class MemorySyncBridge
             _appSettings.Sync.Scanning.TimingScanInterval);
     }
 
-    private void OnLazerIpcChannelConnectionChanged(LazerIpcChannel channel, bool oldValue, bool newValue)
+    private void OnLazerAvailabilityChanged(IGameSyncSource source, bool _)
     {
         if (_isStopping) return;
 
-        _stableSource.SetMemoryScanSuppressed(_lazerIpcBridge.IsAnyChannelConnected);
+        _stableSource.SetMemoryScanSuppressed(source.IsAvailable);
     }
 
     private void OnSyncSettingsChanged(object? sender, PropertyChangedEventArgs e)

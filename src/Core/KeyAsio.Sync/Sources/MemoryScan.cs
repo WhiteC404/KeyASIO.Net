@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Coosu.Shared.IO;
@@ -236,72 +237,101 @@ public class MemoryScan
 
         CleanupProcess(memoryReadObject);
 
+        var connected = false;
         try
         {
-            var processes = Process.GetProcessesByName("osu!");
-            if (processes.Length > 0)
+            _process = FindStableProcess();
+            if (_process == null) return false;
+
+            var uptime = DateTime.Now - _process.StartTime;
+            if (uptime.TotalSeconds < 6)
             {
-                _process = processes[0];
-
-                try
+                _logger.LogInformation(
+                    "osu!stable process detected early (uptime {Uptime:F1}s). Waiting for startup...",
+                    uptime.TotalSeconds);
+                for (var i = 0; i < 60; i++)
                 {
-                    var uptime = DateTime.Now - _process.StartTime;
-                    if (uptime.TotalSeconds < 6)
-                    {
-                        _logger.LogInformation(
-                            "osu! process detected early (uptime {Uptime:F1}s). Delaying connection for 10s...",
-                            uptime.TotalSeconds);
-                        for (var i = 0; i < 60; i++)
-                        {
-                            if (_cts?.IsCancellationRequested == true) return false;
-                            if (_scanSuppressed) return false;
-                            Thread.Sleep(100);
-                        }
-                    }
+                    if (_cts?.IsCancellationRequested == true || _scanSuppressed || _process.HasExited)
+                        return false;
+                    Thread.Sleep(100);
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to check process uptime");
-                }
-
-                _process.EnableRaisingEvents = true;
-                _process.Exited += OnProcessExited;
-                _processExited = false;
-
-                if (_process.HasExited)
-                {
-                    CleanupProcess(memoryReadObject);
-                    return false;
-                }
-
-                _sigScan = new SigScan(_process);
-                _memoryContext = new MemoryContext<OsuMemoryData>(_sigScan, _memoryProfile!);
-                if (!_memoryContext.TryGetProfile("AudioTime", out _valueDefinition))
-                {
-                    _logger.LogWarning("Memory profile is missing required 'AudioTime' definition");
-                }
-
-                _memoryContext.TryGetProfile("ScoreProcessor", out _scoreProcessorValueDefinition);
-                _memoryContext.TryGetProfile("ScoreV2", out _scoreV2ValueDefinition);
-                _memoryContext.TryGetProfile("Combo", out _comboValueDefinition);
-                _memoryContext.TryGetProfile("Hit100", out _hit100ValueDefinition);
-                _memoryContext.TryGetProfile("Hit300", out _hit300ValueDefinition);
-                _memoryContext.TryGetProfile("Hit50", out _hit50ValueDefinition);
-                _memoryContext.TryGetProfile("HitGeki", out _hitGekiValueDefinition);
-                _memoryContext.TryGetProfile("HitKatu", out _hitKatuValueDefinition);
-                _memoryContext.TryGetProfile("HitMiss", out _hitMissValueDefinition);
-
-                _logger.LogInformation("Connected to osu! process");
-                MemoryReadObject.ProcessId = _process.Id;
-                return true;
             }
+
+            _processExited = false;
+            _process.Exited += OnProcessExited;
+            _process.EnableRaisingEvents = true;
+            if (_process.HasExited) return false;
+
+            _sigScan = new SigScan(_process);
+            _memoryContext = new MemoryContext<OsuMemoryData>(_sigScan, _memoryProfile!);
+            if (!_memoryContext.TryGetProfile("AudioTime", out _valueDefinition))
+            {
+                _logger.LogWarning("Memory profile is missing required 'AudioTime' definition");
+            }
+
+            _memoryContext.TryGetProfile("ScoreProcessor", out _scoreProcessorValueDefinition);
+            _memoryContext.TryGetProfile("ScoreV2", out _scoreV2ValueDefinition);
+            _memoryContext.TryGetProfile("Combo", out _comboValueDefinition);
+            _memoryContext.TryGetProfile("Hit100", out _hit100ValueDefinition);
+            _memoryContext.TryGetProfile("Hit300", out _hit300ValueDefinition);
+            _memoryContext.TryGetProfile("Hit50", out _hit50ValueDefinition);
+            _memoryContext.TryGetProfile("HitGeki", out _hitGekiValueDefinition);
+            _memoryContext.TryGetProfile("HitKatu", out _hitKatuValueDefinition);
+            _memoryContext.TryGetProfile("HitMiss", out _hitMissValueDefinition);
+
+            memoryReadObject.ProcessId = _process.Id;
+            _logger.LogInformation("Connected to osu!stable process {ProcessId}", _process.Id);
+            connected = true;
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error finding osu! process");
+            _logger.LogError(ex, "Error connecting to osu!stable process");
+            return false;
         }
+        finally
+        {
+            if (!connected && _process != null)
+                CleanupProcess(memoryReadObject, delayOnDisconnect: false);
+        }
+    }
 
-        return false;
+    private static Process? FindStableProcess()
+    {
+        var processes = Process.GetProcessesByName("osu!");
+        Process? stableProcess = null;
+        try
+        {
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (process.HasExited || process.MainModule?.FileName is not { Length: > 0 } path)
+                        continue;
+
+                    // Stable and lazer share the same executable name but report different company names.
+                    if (FileVersionInfo.GetVersionInfo(path).CompanyName == "ppy")
+                    {
+                        stableProcess = process;
+                        return stableProcess;
+                    }
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or IOException)
+                {
+                    // The process may have exited or become inaccessible during enumeration.
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                if (process != stableProcess)
+                    process.Dispose();
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
