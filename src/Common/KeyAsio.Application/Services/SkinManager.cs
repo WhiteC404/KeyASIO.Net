@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Coosu.Shared.IO;
 using dnlib.DotNet;
@@ -85,9 +86,11 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
     private readonly AsyncSequentialWorker _skinLoadingWorker;
     private bool _disposed;
 
-    private readonly Dictionary<string, byte[]> _stableDefaultResources = new();
-    private readonly Dictionary<string, IBeatmapResourceCatalog> _lazerSkinCatalogs = new();
-    private readonly Dictionary<string, byte[]> _lazerDefaultResources = new();
+    private readonly ConcurrentDictionary<string, byte[]> _stableDefaultResources = new();
+    private readonly ConcurrentDictionary<string, IBeatmapResourceCatalog> _lazerSkinCatalogs = new();
+    private readonly ConcurrentDictionary<string, byte[]> _lazerDefaultResources = new();
+    private string? _stableDefaultResourcesPath;
+    private string? _lazerDefaultResourcesPath;
 
     // Lazer skin context (received via IPC).
     private LazerSkinInfo[]? _lazerSkinInfos;
@@ -134,27 +137,34 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
 
     public bool TryGetStableResource(string key, out byte[] data)
     {
-        return _stableDefaultResources.TryGetValue(key, out data);
+        if (_stableDefaultResources.TryGetValue(key, out data!) && data.Length > 0)
+        {
+            return true;
+        }
+
+        data = null!;
+        return false;
     }
 
     public bool TryGetSkinCatalog(string folder, out IBeatmapResourceCatalog catalog)
     {
-        return _lazerSkinCatalogs.TryGetValue(folder, out catalog);
+        return _lazerSkinCatalogs.TryGetValue(folder, out catalog!);
     }
 
     public bool TryGetLazerResource(string skinFolder, string key, out byte[] data)
     {
         // Try the specified skin first
-        if (_lazerDefaultResources.TryGetValue($"{skinFolder}:{key}", out data))
+        if (_lazerDefaultResources.TryGetValue($"{skinFolder}:{key}", out data!) && data.Length > 0)
             return true;
 
         // Fallback: classic → triangles (for missing keys like nightcore in argon)
-        if (_lazerDefaultResources.TryGetValue($"{{lazer-classic}}:{key}", out data))
+        if (_lazerDefaultResources.TryGetValue($"{{lazer-classic}}:{key}", out data!) && data.Length > 0)
             return true;
 
-        if (_lazerDefaultResources.TryGetValue($"{{lazer-triangles}}:{key}", out data))
+        if (_lazerDefaultResources.TryGetValue($"{{lazer-triangles}}:{key}", out data!) && data.Length > 0)
             return true;
 
+        data = null!;
         return false;
     }
 
@@ -300,8 +310,10 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
         // Clear default resources so they get re-extracted from the appropriate source
         // (osu!gameplay.dll for stable, osu.Game.Resources.dll for lazer).
         _stableDefaultResources.Clear();
+        _stableDefaultResourcesPath = null;
         _lazerSkinCatalogs.Clear();
         _lazerDefaultResources.Clear();
+        _lazerDefaultResourcesPath = null;
 
         if (newClientType == GameClientType.Stable)
         {
@@ -406,17 +418,20 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
 
         if (_appSettings.Paths.AllowAutoLoadSkins != true)
         {
+            _stableDefaultResources.Clear();
+            _stableDefaultResourcesPath = null;
+            _lazerSkinCatalogs.Clear();
+            _lazerDefaultResources.Clear();
+            _lazerDefaultResourcesPath = null;
+
             await _dispatcher.InvokeAsync(() =>
             {
                 _sharedViewModel.Skins.Clear();
                 _sharedViewModel.Skins.Add(SkinDescription.Internal);
                 _skinSelectionPreferences.ApplyProgrammaticSelection(
                     () => _sharedViewModel.SelectedSkin = SkinDescription.Internal);
-                foreach (var key in _stableDefaultResources.Keys)
-                {
-                    _stableDefaultResources[key] = Array.Empty<byte>();
-                }
             });
+            ResourcesChanged?.Invoke();
             return;
         }
 
@@ -623,8 +638,7 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
             }
 
             _sharedViewModel.Skins.Clear();
-            var type = SynchronizationContext.Current.GetType();
-            if (type.Namespace == "System.Windows.Threading")
+            if (SynchronizationContext.Current?.GetType().Namespace == "System.Windows.Threading")
             {
                 foreach (var skinDescription in newSkinList)
                 {
@@ -645,7 +659,15 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
 
     private void ExtractDefaultResources(string osuPath, CancellationToken token)
     {
-        if (_stableDefaultResources.Count > 0) return;
+        if (!_stableDefaultResources.IsEmpty &&
+            string.Equals(_stableDefaultResourcesPath, osuPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _stableDefaultResources.Clear();
+        _stableDefaultResourcesPath = null;
+
         var dllPath = Path.Combine(osuPath, "osu!gameplay.dll");
         if (!File.Exists(dllPath))
         {
@@ -672,9 +694,9 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
                 {
                     reader.GetResourceData(resourcesKey, out var resourceType, out var resourceData);
 
-                    if (!resourceType.Contains("ResourceTypeCode.ByteArray")) return;
+                    if (!resourceType.Contains("ResourceTypeCode.ByteArray")) continue;
                     // [ 长度 (Int32, 4字节) ] + [ 实际数据 (N字节) ]
-                    if (resourceData.Length <= 4) return;
+                    if (resourceData.Length <= 4) continue;
 
                     var bytes = resourceData.AsSpan(4).ToArray();
                     _stableDefaultResources[resourcesKey] = bytes;
@@ -685,6 +707,11 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
                     _logger.LogWarning("Resource '{ResourcesKey}' not found in osu!gameplay.dll", resourcesKey);
                 }
             }
+
+            if (!_stableDefaultResources.IsEmpty)
+            {
+                _stableDefaultResourcesPath = osuPath;
+            }
         }
         catch (Exception ex)
         {
@@ -694,14 +721,21 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
 
     private void ExtractLazerDefaultResources(CancellationToken token)
     {
-        if (_lazerDefaultResources.Count > 0) return;
-
         var exeDir = _lazerExeDirectory;
         if (string.IsNullOrEmpty(exeDir))
         {
             _logger.LogDebug("Lazer exe directory not available; skipping default resource extraction.");
             return;
         }
+
+        if (!_lazerDefaultResources.IsEmpty &&
+            string.Equals(_lazerDefaultResourcesPath, exeDir, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _lazerDefaultResources.Clear();
+        _lazerDefaultResourcesPath = null;
 
         var dllPath = Path.Combine(exeDir, "osu.Game.Resources.dll");
         if (!File.Exists(dllPath))
@@ -765,6 +799,11 @@ public sealed class SkinManager : ISkinResourceProvider, IDisposable
                         }
                     }
                 }
+            }
+
+            if (!_lazerDefaultResources.IsEmpty)
+            {
+                _lazerDefaultResourcesPath = exeDir;
             }
 
             _logger.LogInformation("Extracted {Count} lazer default audio resources from osu.Game.Resources.dll",

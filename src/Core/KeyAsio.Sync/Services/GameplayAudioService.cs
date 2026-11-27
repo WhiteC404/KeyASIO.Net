@@ -384,7 +384,8 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         var lazerSkinFolder = skinFolder.StartsWith("{lazer-", StringComparison.OrdinalIgnoreCase)
             ? skinFolder
             : "{lazer-classic}";
-        if (_skinResources.TryGetLazerResource(lazerSkinFolder, filenameKey, out var lazerBytes))
+        if (_skinResources.TryGetLazerResource(lazerSkinFolder, filenameKey, out var lazerBytes) &&
+            lazerBytes.Length > 0)
         {
             var key = $"lazer://{lazerSkinFolder}/{filenameKey}";
             using var stream = new MemoryStream(lazerBytes);
@@ -392,7 +393,7 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         }
 
         // Stable fallback (osu!gameplay.dll resources)
-        if (_skinResources.TryGetStableResource(filenameKey, out var bytes))
+        if (_skinResources.TryGetStableResource(filenameKey, out var bytes) && bytes.Length > 0)
         {
             var key = $"internal://{filenameKey}";
             using var stream = new MemoryStream(bytes);

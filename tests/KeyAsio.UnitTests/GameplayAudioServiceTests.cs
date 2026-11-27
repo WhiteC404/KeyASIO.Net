@@ -61,6 +61,52 @@ public sealed class GameplayAudioServiceTests : IDisposable
         Assert.True(cachedAudio.Length > 0);
     }
 
+    [Fact]
+    public async Task EmptyComboBreakResource_IsIgnoredAndRecoveredWhenValidBytesBecomeAvailable()
+    {
+        var beatmapFolder = Directory.CreateDirectory(Path.Combine(_temporaryFolder, "beatmap-empty")).FullName;
+        var skinFolder = Directory.CreateDirectory(Path.Combine(_temporaryFolder, "skin-empty")).FullName;
+        var runtimeState = new TestPlaybackRuntimeState(skinFolder);
+        var skinResources = new TestSkinResourceProvider();
+        skinResources.SetStableResource("combobreak", Array.Empty<byte>());
+        var playbackDevice = new Mock<IWavePlayer>();
+        var playbackEngine = new Mock<IPlaybackEngine>();
+        playbackEngine.SetupGet(x => x.CurrentDevice).Returns(playbackDevice.Object);
+        playbackEngine.SetupGet(x => x.EngineWaveFormat).Returns(new WaveFormat(44100, 16, 2));
+
+        using var service = new GameplayAudioService(
+            NullLogger<GameplayAudioService>.Instance,
+            new SyncSessionContext(new AppSettings()),
+            new AppSettings(),
+            playbackEngine.Object,
+            new AudioCacheManager(NullLogger<AudioCacheManager>.Instance),
+            runtimeState,
+            skinResources);
+        service.SetContext(beatmapFolder, audioFilename: null);
+
+        service.PrecacheMusicAndSkinInBackground();
+
+        await WaitUntilAsync(() => skinResources.StableLookupCount > 0);
+        Assert.False(service.TryGetCachedAudio("combobreak", out _));
+
+        skinResources.SetStableResource("combobreak", CreatePcmWave());
+
+        CachedAudio? cachedAudio = null;
+        await WaitUntilAsync(() =>
+        {
+            if (!service.TryGetCachedAudio("combobreak", out var candidate) || candidate is not { Length: > 0 })
+            {
+                return false;
+            }
+
+            cachedAudio = candidate;
+            return true;
+        });
+
+        Assert.NotNull(cachedAudio);
+        Assert.True(cachedAudio.Length > 0);
+    }
+
     public void Dispose()
     {
         Directory.Delete(_temporaryFolder, recursive: true);
