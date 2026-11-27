@@ -74,6 +74,7 @@ public class PlayingState : IGameState
 
     public void Exit(SyncSessionContext ctx, OsuMemoryStatus to)
     {
+        _gameplaySessionManager.Stop();
     }
 
     public void OnTick(SyncSessionContext ctx, int prevMs, int currMs, bool isAudioPaused)
@@ -178,10 +179,7 @@ public class PlayingState : IGameState
 
     private void PlayAutoPlaybackIfNeeded(SyncSessionContext ctx)
     {
-        if (!_runtimeState.AutoMode &&
-            (ctx.PlayMods & Mods.Autoplay) == 0 &&
-            (ctx.PlayMods & Mods.Relax) == 0 &&
-            !ctx.IsReplay) return;
+        if (!ctx.ShouldAutoPlayHitsounds(_runtimeState.AutoMode)) return;
 
         _playbackBuffer.Clear();
         _gameplaySessionManager.CurrentHitsoundSequencer.ProcessAutoPlay(_playbackBuffer, false);
@@ -199,11 +197,12 @@ public class PlayingState : IGameState
         _playbackBuffer.Clear();
         _gameplaySessionManager.CurrentHitsoundSequencer.ProcessAutoPlay(_playbackBuffer, true);
 
+        var mode = _gameplaySessionManager.OsuFile?.General?.Mode;
         var count = _playbackBuffer.Count;
         for (int i = 0; i < count; i++)
         {
             var playbackObject = _playbackBuffer[i];
-            if (_gameplaySessionManager.OsuFile.General.Mode == GameMode.Mania &&
+            if (mode == GameMode.Mania &&
                 playbackObject.PlaybackEvent is SampleEvent { Layer: SampleLayer.Sampling })
             {
                 _sfxPlaybackService.DispatchPlayback(playbackObject,

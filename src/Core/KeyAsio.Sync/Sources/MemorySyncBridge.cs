@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 
 namespace KeyAsio.Sync.Sources;
 
-public class MemorySyncBridge
+public class MemorySyncBridge : IDisposable
 {
     private readonly GameSyncSourceCoordinator _sourceCoordinator;
     private readonly StableMemoryGameSyncSource _stableSource;
@@ -14,9 +14,11 @@ public class MemorySyncBridge
     private readonly SyncSessionContext _syncSessionContext;
     private readonly AppSettings _appSettings;
     private readonly ILogger<MemorySyncBridge> _logger;
+    private readonly SemaphoreSlim _scanTransition = new(1, 1);
     private bool _initialized;
     private bool _isRunning;
     private volatile bool _isStopping;
+    private volatile bool _disposed;
 
     public MemorySyncBridge(
         GameSyncSourceCoordinator sourceCoordinator,
@@ -48,10 +50,7 @@ public class MemorySyncBridge
         _logger.LogInformation("Initial EnableSync state: {State}", _appSettings.Sync.EnableSync);
         _logger.LogInformation("Initial EnableMixSync state: {State}", _appSettings.Sync.EnableMixSync);
 
-        if (_appSettings.Sync.EnableSync)
-        {
-            StartScanning();
-        }
+        _ = ApplySyncSettingAsync();
     }
 
     private void OnScanningSettingsChanged(object? sender, PropertyChangedEventArgs e)
@@ -80,16 +79,7 @@ public class MemorySyncBridge
     {
         if (e.PropertyName == nameof(AppSettingsSync.EnableSync))
         {
-            if (_appSettings.Sync.EnableSync)
-            {
-                _logger.LogInformation("Memory Sync enabled.");
-                StartScanning();
-            }
-            else
-            {
-                _logger.LogInformation("Memory Sync disabled.");
-                _ = StopScanningAsync();
-            }
+            _ = ApplySyncSettingAsync();
         }
         else if (e.PropertyName == nameof(AppSettingsSync.EnableMixSync))
         {
@@ -97,10 +87,34 @@ public class MemorySyncBridge
         }
     }
 
-    private void StartScanning()
+    private async Task ApplySyncSettingAsync()
     {
-        if (_isRunning) return;
+        await _scanTransition.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed) return;
 
+            var enableSync = _appSettings.Sync.EnableSync;
+            if (enableSync == _isRunning) return;
+
+            _logger.LogInformation("Changing memory sync state to {Enabled}.", enableSync);
+            if (enableSync)
+                await StartScanningAsync().ConfigureAwait(false);
+            else
+                await StopScanningAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to change the memory sync state.");
+        }
+        finally
+        {
+            _scanTransition.Release();
+        }
+    }
+
+    private async Task StartScanningAsync()
+    {
         try
         {
             var player = EncodeUtils.FromBase64String(_appSettings.Logging.PlayerBase64 ?? "", Encoding.ASCII);
@@ -112,24 +126,69 @@ public class MemorySyncBridge
         }
 
         ConfigureStableSourceIntervals();
-        _sourceCoordinator.Start();
-        _isRunning = true;
+        try
+        {
+            _sourceCoordinator.Start();
+            _isRunning = true;
+        }
+        catch
+        {
+            // Roll back partially started sources so _isRunning stays consistent with coordinator state.
+            try
+            {
+                await StopScanningAsync().ConfigureAwait(false);
+            }
+            catch (Exception rollbackEx)
+            {
+                _logger.LogWarning(rollbackEx, "Failed to roll back sync sources after a partial start failure.");
+            }
+
+            throw;
+        }
     }
 
     private async Task StopScanningAsync()
     {
-        if (!_isRunning) return;
-
         _isStopping = true;
         try
         {
-            await _sourceCoordinator.StopAsync();
+            await _sourceCoordinator.StopAsync().ConfigureAwait(false);
         }
         finally
         {
             _stableSource.SetMemoryScanSuppressed(false);
             _isStopping = false;
             _isRunning = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (_initialized)
+        {
+            _appSettings.Sync.Scanning.PropertyChanged -= OnScanningSettingsChanged;
+            _appSettings.Sync.PropertyChanged -= OnSyncSettingsChanged;
+            _lazerSource.AvailabilityChanged -= OnLazerAvailabilityChanged;
+        }
+
+        _scanTransition.Wait();
+        try
+        {
+            if (_isRunning)
+            {
+                StopScanningAsync().GetAwaiter().GetResult();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to stop memory sync bridge during disposal.");
+        }
+        finally
+        {
+            _scanTransition.Release();
         }
     }
 }

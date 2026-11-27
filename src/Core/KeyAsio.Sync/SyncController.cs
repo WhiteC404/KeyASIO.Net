@@ -43,13 +43,13 @@ public class SyncController : IDisposable
 
         var standardAudioProvider = new StandardHitsoundSequencer(
             standardSequencerLogger,
-            appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager);
+            appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager, runtimeState);
         var taikoAudioProvider = new TaikoHitsoundSequencer(
             taikoSequencerLogger,
-            appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager);
+            appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager, runtimeState);
         var maniaAudioProvider = new ManiaHitsoundSequencer(
             maniaSequencerLogger,
-            appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager);
+            appSettings, syncSessionContext, runtimeState, playbackEngine, gameplayAudioService, gameplaySessionManager);
         var catchAudioProvider = new CatchHitsoundSequencer(
             catchSequencerLogger,
             appSettings, syncSessionContext, playbackEngine, gameplayAudioService, gameplaySessionManager);
@@ -72,6 +72,7 @@ public class SyncController : IDisposable
     }
 
     private CancellationTokenSource? _syncLoopCts;
+    private long _statusTransitionVersion;
 
     public void Start()
     {
@@ -138,6 +139,8 @@ public class SyncController : IDisposable
 
     private async Task OnStatusChanged(OsuMemoryStatus oldStatus, OsuMemoryStatus newStatus)
     {
+        var transitionVersion = Interlocked.Increment(ref _statusTransitionVersion);
+
         if (!_extensionHost.HandleStateExit(oldStatus))
         {
             _stateMachine.ExitCurrent(_syncSessionContext, newStatus);
@@ -148,7 +151,10 @@ public class SyncController : IDisposable
             await _stateMachine.EnterFromAsync(_syncSessionContext, oldStatus, newStatus);
         }
 
-        _extensionHost.NotifyStatusChanged(oldStatus, newStatus);
+        if (Volatile.Read(ref _statusTransitionVersion) == transitionVersion)
+        {
+            _extensionHost.NotifyStatusChanged(oldStatus, newStatus);
+        }
     }
 
     private Task OnBeatmapChanged(BeatmapIdentifier oldBeatmap, BeatmapIdentifier newBeatmap)

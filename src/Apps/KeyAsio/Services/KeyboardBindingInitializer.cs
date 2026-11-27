@@ -152,14 +152,15 @@ public class KeyboardBindingInitializer
                 _playbackBuffer.Clear();
 
                 var sequencer = _gameplaySessionManager.CurrentHitsoundSequencer;
+                var osuFile = _gameplaySessionManager.OsuFile;
                 int keyIndex = -1;
                 int keyTotal = 0;
 
                 if (sequencer is ManiaHitsoundSequencer)
                 {
-                    if (_gameplaySessionManager.OsuFile != null)
+                    if (osuFile?.Difficulty != null)
                     {
-                        int keyCount = (int)_gameplaySessionManager.OsuFile.Difficulty.CircleSize;
+                        int keyCount = (int)osuFile.Difficulty.CircleSize;
                         if (_appSettings.Input.ManiaKeys.TryGetValue(keyCount, out var maniaKeys))
                         {
                             keyIndex = maniaKeys.IndexOf(hookKey);
@@ -169,7 +170,7 @@ public class KeyboardBindingInitializer
                 }
                 else
                 {
-                    var mode = _gameplaySessionManager.OsuFile?.General.Mode ?? GameMode.Circle;
+                    var mode = osuFile?.General?.Mode ?? GameMode.Circle;
                     List<HookKeys>? activeKeys = mode switch
                     {
                         GameMode.Taiko => _appSettings.Input.TaikoKeys,

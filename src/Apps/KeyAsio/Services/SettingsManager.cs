@@ -21,8 +21,10 @@ public class SettingsManager : IDisposable
     private readonly ISukiToastManager _toastManager;
 
     private readonly List<INotifyPropertyChanged> _observedSettings = new();
+    private readonly Lock _debounceLock = new();
+    private readonly Lock _fileSaveLock = new();
     private CancellationTokenSource? _saveDebounceCts;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public SettingsManager(
         ILogger<SettingsManager> logger,
@@ -98,42 +100,49 @@ public class SettingsManager : IDisposable
                 _playbackEngine.EffectVolume = _appSettings.Audio.EffectVolume / 100f;
                 DebounceSave();
             }
-        }
-        else if (sender is AppSettingsSyncPlayback)
-        {
-            if (e.PropertyName == nameof(AppSettingsSyncPlayback.BalanceFactor) ||
-                e.PropertyName == nameof(AppSettingsSyncPlayback.BalanceMode))
+            else if (e.PropertyName == nameof(AppSettingsAudio.EnableExtendedVolume))
             {
-                DebounceSave();
+                SaveSettingsImmediate();
             }
-            else if (e.PropertyName == nameof(AppSettingsSyncPlayback.LimiterType))
+        }
+        else if (sender is AppSettingsSyncPlayback &&
+                 e.PropertyName is nameof(AppSettingsSyncPlayback.BalanceFactor)
+                     or nameof(AppSettingsSyncPlayback.BalanceMode)
+                     or nameof(AppSettingsSyncPlayback.LimiterType))
+        {
+            if (e.PropertyName == nameof(AppSettingsSyncPlayback.LimiterType))
             {
                 _playbackEngine.LimiterType = _appSettings.Sync.Playback.LimiterType;
-                DebounceSave();
             }
-        }
-        else if (sender is AppSettingsGeneral && e.PropertyName == nameof(AppSettingsGeneral.Theme))
-        {
-            ApplyTheme();
-            try
-            {
-                _appSettings.Save();
-            }
-            catch (Exception ex)
-            {
-                HandleSaveException(ex);
-            }
+
+            DebounceSave();
         }
         else
         {
-            try
+            if (sender is AppSettingsGeneral && e.PropertyName == nameof(AppSettingsGeneral.Theme))
             {
+                ApplyTheme();
+            }
+
+            SaveSettingsImmediate();
+        }
+    }
+
+    private void SaveSettingsImmediate()
+    {
+        if (_disposed) return;
+
+        try
+        {
+            lock (_fileSaveLock)
+            {
+                if (_disposed) return;
                 _appSettings.Save();
             }
-            catch (Exception ex)
-            {
-                HandleSaveException(ex);
-            }
+        }
+        catch (Exception ex)
+        {
+            HandleSaveException(ex);
         }
     }
 
@@ -152,31 +161,44 @@ public class SettingsManager : IDisposable
 
     private void DebounceSave()
     {
-        _saveDebounceCts?.Cancel();
-        _saveDebounceCts = new CancellationTokenSource();
-        var token = _saveDebounceCts.Token;
-
-        Task.Delay(500, token).ContinueWith(t =>
+        CancellationToken token;
+        lock (_debounceLock)
         {
-            if (t.IsCanceled) return;
-            Dispatcher.UIThread.Post(() =>
+            if (_disposed) return;
+            var previousCts = _saveDebounceCts;
+            _saveDebounceCts = new CancellationTokenSource();
+            token = _saveDebounceCts.Token;
+
+            if (previousCts != null)
             {
-                try
-                {
-                    _appSettings.Save();
-                }
-                catch (Exception ex)
-                {
-                    HandleSaveException(ex);
-                }
-            });
-        });
+                previousCts.Cancel();
+                previousCts.Dispose();
+            }
+        }
+
+        _ = Task.Delay(500, token).ContinueWith(t =>
+        {
+            if (t.IsCanceled || _disposed) return;
+            Dispatcher.UIThread.Post(SaveSettingsImmediate);
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        CancellationTokenSource? ctsToDispose;
+        lock (_debounceLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            ctsToDispose = _saveDebounceCts;
+            _saveDebounceCts = null;
+        }
+
+        if (ctsToDispose != null)
+        {
+            ctsToDispose.Cancel();
+            ctsToDispose.Dispose();
+        }
 
         foreach (var obj in _observedSettings)
         {
@@ -184,7 +206,6 @@ public class SettingsManager : IDisposable
         }
 
         _observedSettings.Clear();
-        _saveDebounceCts?.Dispose();
         GC.SuppressFinalize(this);
     }
 }

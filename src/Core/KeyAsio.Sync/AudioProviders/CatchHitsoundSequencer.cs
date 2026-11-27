@@ -20,6 +20,7 @@ public class CatchHitsoundSequencer : IHitsoundSequencer
     private readonly GameplayAudioService _gameplayAudioService;
     private readonly GameplaySessionManager _gameplaySessionManager;
 
+    private readonly Lock _queueLock = new();
     private Queue<SampleEvent> _hitQueue = new();
     private Queue<PlaybackEvent> _playbackQueue = new();
 
@@ -42,11 +43,14 @@ public class CatchHitsoundSequencer : IHitsoundSequencer
 
     public void SeekTo(int playTime)
     {
-        _hitQueue = new Queue<SampleEvent>(
-            _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
-        );
-        _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
-            .Where(k => k.Offset >= playTime));
+        lock (_queueLock)
+        {
+            _hitQueue = new Queue<SampleEvent>(
+                _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
+            );
+            _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
+                .Where(k => k.Offset >= playTime));
+        }
     }
 
     public void ProcessAutoPlay(List<PlaybackInfo> buffer, bool processHitQueueAsAuto)
@@ -57,12 +61,14 @@ public class CatchHitsoundSequencer : IHitsoundSequencer
 
         // In Catch mode (Auto-Play approach), we treat hit objects as auto-played sounds.
         // Regardless of whether it's replay/auto or manual play, we play the hit sounds.
+        lock (_queueLock)
+        {
+            // Process background sounds (slider ticks, etc.)
+            ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
 
-        // Process background sounds (slider ticks, etc.)
-        ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
-
-        // Process hit objects (fruits, drops)
-        ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+            // Process hit objects (fruits, drops)
+            ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+        }
     }
 
     public void ProcessInteraction(List<PlaybackInfo> buffer, int keyIndex, int keyTotal)

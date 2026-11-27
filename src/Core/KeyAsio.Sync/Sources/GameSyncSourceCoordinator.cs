@@ -8,6 +8,7 @@ public sealed class GameSyncSourceCoordinator
     private readonly SyncSessionContext _syncSessionContext;
     private readonly IGameSyncSource[] _sources;
     private readonly ILogger<GameSyncSourceCoordinator> _logger;
+    private readonly Lock _syncLock = new();
     private IGameSyncSource? _activeSource;
     private bool _started;
     private GameSyncSnapshot? _disconnectedSnapshot;
@@ -33,66 +34,100 @@ public sealed class GameSyncSourceCoordinator
 
     public void Start()
     {
-        if (_started) return;
-        _started = true;
+        lock (_syncLock)
+        {
+            if (_started) return;
+            _started = true;
+        }
 
         foreach (var source in _sources)
         {
             source.Start();
         }
 
-        SelectActiveSource(applyCurrentSnapshot: true);
+        GameClientType? changedClientType;
+        lock (_syncLock)
+        {
+            if (!_started) return;
+            changedClientType = SelectActiveSourceLocked(applyCurrentSnapshot: true);
+        }
+
+        NotifyClientTypeChanged(changedClientType);
     }
 
     public async Task StopAsync()
     {
-        if (!_started) return;
-        _started = false;
+        lock (_syncLock)
+        {
+            if (!_started) return;
+            _started = false;
+        }
 
         foreach (var source in _sources)
         {
-            await source.StopAsync();
+            await source.StopAsync().ConfigureAwait(false);
         }
 
-        _activeSource = null;
-        ApplyDisconnectedSnapshot(GameClientType.Stable);
+        GameClientType? changedClientType;
+        lock (_syncLock)
+        {
+            if (_started) return;
+            _activeSource = null;
+            changedClientType = ApplyDisconnectedSnapshotLocked(GameClientType.Stable);
+        }
+
+        NotifyClientTypeChanged(changedClientType);
     }
 
     private void OnSourceAvailabilityChanged(IGameSyncSource source, bool isAvailable)
     {
-        if (!_started) return;
-
-        if (!isAvailable && ReferenceEquals(_activeSource, source))
+        GameClientType? changedClientType;
+        lock (_syncLock)
         {
-            _logger.LogInformation("Game sync source unavailable: {Source}", source.Name);
-        }
-        else if (isAvailable)
-        {
-            _logger.LogInformation("Game sync source available: {Source}", source.Name);
+            if (!_started) return;
+
+            if (!isAvailable && ReferenceEquals(_activeSource, source))
+            {
+                _logger.LogInformation("Game sync source unavailable: {Source}", source.Name);
+            }
+            else if (isAvailable)
+            {
+                _logger.LogInformation("Game sync source available: {Source}", source.Name);
+            }
+
+            changedClientType = SelectActiveSourceLocked(applyCurrentSnapshot: true);
         }
 
-        SelectActiveSource(applyCurrentSnapshot: true);
+        NotifyClientTypeChanged(changedClientType);
     }
 
     private void OnSourceSnapshotReceived(IGameSyncSource source, GameSyncSnapshot snapshot)
     {
-        if (!_started) return;
-
-        SelectActiveSource(applyCurrentSnapshot: false);
-        if (!ReferenceEquals(_activeSource, source))
+        GameClientType? changedClientType = null;
+        lock (_syncLock)
         {
-            return;
+            if (!_started) return;
+
+            var selectionChanged = SelectActiveSourceLocked(applyCurrentSnapshot: false);
+            if (!ReferenceEquals(_activeSource, source))
+            {
+                changedClientType = selectionChanged;
+            }
+            else
+            {
+                changedClientType = ApplySnapshotLocked(snapshot) ?? selectionChanged;
+            }
         }
 
-        ApplySnapshot(snapshot);
+        NotifyClientTypeChanged(changedClientType);
     }
 
-    private void SelectActiveSource(bool applyCurrentSnapshot)
+    private GameClientType? SelectActiveSourceLocked(bool applyCurrentSnapshot)
     {
         var nextSource = _sources.FirstOrDefault(source => source.IsAvailable);
         if (ReferenceEquals(_activeSource, nextSource))
         {
-            return;
+            return null;
         }
 
         var oldSource = _activeSource;
@@ -105,24 +140,25 @@ public sealed class GameSyncSourceCoordinator
         {
             if (applyCurrentSnapshot)
             {
-                ApplySnapshot(nextSource.CurrentSnapshot);
+                return ApplySnapshotLocked(nextSource.CurrentSnapshot);
             }
+
+            return null;
         }
-        else
-        {
-            ApplyDisconnectedSnapshot(oldSource?.ClientType ?? GameClientType.Stable);
-        }
+
+        return ApplyDisconnectedSnapshotLocked(oldSource?.ClientType ?? GameClientType.Stable);
     }
 
-    private void ApplySnapshot(GameSyncSnapshot snapshot)
+    private GameClientType? ApplySnapshotLocked(GameSyncSnapshot snapshot)
     {
+        GameClientType? changedClientType = null;
         try
         {
             _syncSessionContext.ClientType = snapshot.ClientType;
             if (snapshot.ClientType != _lastClientType)
             {
                 _lastClientType = snapshot.ClientType;
-                ClientTypeChanged?.Invoke(snapshot.ClientType);
+                changedClientType = snapshot.ClientType;
             }
 
             _syncSessionContext.ProcessId = snapshot.ProcessId;
@@ -143,19 +179,28 @@ public sealed class GameSyncSourceCoordinator
         {
             _logger.LogWarning(ex, "Failed to apply game sync snapshot from {ClientType}.", snapshot.ClientType);
         }
+
+        return changedClientType;
     }
 
-    private void ApplyDisconnectedSnapshot(GameClientType disconnectedClientType)
+    private GameClientType? ApplyDisconnectedSnapshotLocked(GameClientType disconnectedClientType)
     {
         var fallbackClientType = disconnectedClientType == GameClientType.Lazer
             ? GameClientType.Stable
             : disconnectedClientType;
 
-        // Reuse a single disconnected snapshot to avoid allocating on the
-        // low-frequency disconnect path. ApplySnapshot only reads the fields
-        // synchronously, so mutating a shared instance is safe.
+        // Reuse a single disconnected snapshot under _syncLock to avoid allocating on the
+        // low-frequency disconnect path.
         _disconnectedSnapshot ??= GameSyncSnapshot.NotRunning(fallbackClientType);
         _disconnectedSnapshot.ResetToNotRunning(fallbackClientType);
-        ApplySnapshot(_disconnectedSnapshot);
+        return ApplySnapshotLocked(_disconnectedSnapshot);
+    }
+
+    private void NotifyClientTypeChanged(GameClientType? clientType)
+    {
+        if (clientType.HasValue)
+        {
+            ClientTypeChanged?.Invoke(clientType.Value);
+        }
     }
 }

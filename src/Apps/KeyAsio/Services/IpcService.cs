@@ -1,6 +1,7 @@
 ﻿using System.IO.Pipes;
 using Avalonia.Controls;
 using Avalonia.Threading;
+using KeyAsio.Configuration;
 using KeyAsio.Utils;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -10,15 +11,23 @@ namespace KeyAsio.Services;
 public class IpcService : BackgroundService
 {
     private readonly ILogger<IpcService> _logger;
+    private readonly AppSettings _appSettings;
     public const string PipeName = "KeyAsio.Net.Pipe";
 
-    public IpcService(ILogger<IpcService> logger)
+    public IpcService(ILogger<IpcService> logger, AppSettings appSettings)
     {
         _logger = logger;
+        _appSettings = appSettings;
     }
 
     protected override async Task ExecuteAsync(CancellationToken token)
     {
+        if (_appSettings.General.AllowMultipleInstance)
+        {
+            _logger.LogDebug("AllowMultipleInstance is enabled; skipping single-instance IPC pipe listener.");
+            return;
+        }
+
         while (!token.IsCancellationRequested)
         {
             try
@@ -49,6 +58,11 @@ public class IpcService : BackgroundService
             }
             catch (OperationCanceledException)
             {
+                break;
+            }
+            catch (IOException ex)
+            {
+                _logger.LogInformation(ex, "Single-instance IPC pipe is already owned by another KeyASIO instance; stopping listener.");
                 break;
             }
             catch (Exception ex)

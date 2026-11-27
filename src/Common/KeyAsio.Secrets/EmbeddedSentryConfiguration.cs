@@ -13,7 +13,10 @@
 
     public static void Configure(SentryOptions options)
     {
-        options.Dsn = Secrets.Dsn;
+        options.Dsn = Uri.TryCreate(Secrets.Dsn, UriKind.Absolute, out var dsnUri) &&
+                      dsnUri.Scheme is "http" or "https"
+            ? Secrets.Dsn
+            : SentryConstants.DisableSdkDsnValue;
 #if !RELEASE
         options.Debug = true;
         options.Environment = "debug";

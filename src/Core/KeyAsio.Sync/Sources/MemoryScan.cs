@@ -35,6 +35,7 @@ public class MemoryScan
     private readonly ManualResetEventSlim _scanResumeEvent = new(true);
     private volatile bool _scanSuppressed;
     private ValueDefinition? _valueDefinition;
+    private ValueDefinition? _isReplayValueDefinition;
     private ValueDefinition? _scoreProcessorValueDefinition;
     private ValueDefinition? _scoreV2ValueDefinition;
     private ValueDefinition? _comboValueDefinition;
@@ -269,6 +270,7 @@ public class MemoryScan
                 _logger.LogWarning("Memory profile is missing required 'AudioTime' definition");
             }
 
+            _memoryContext.TryGetProfile("IsReplay", out _isReplayValueDefinition);
             _memoryContext.TryGetProfile("ScoreProcessor", out _scoreProcessorValueDefinition);
             _memoryContext.TryGetProfile("ScoreV2", out _scoreV2ValueDefinition);
             _memoryContext.TryGetProfile("Combo", out _comboValueDefinition);
@@ -356,6 +358,7 @@ public class MemoryScan
         _memoryContext = null;
         _songsDirectory = null;
         _scanSuccessful = false;
+        _isReplayValueDefinition = null;
         _scoreProcessorValueDefinition = null;
         _scoreV2ValueDefinition = null;
         _comboValueDefinition = null;
@@ -367,6 +370,7 @@ public class MemoryScan
         _hitMissValueDefinition = null;
 
         _folderName = null;
+        memoryReadObject.IsReplay = false;
         memoryReadObject.OsuStatus = OsuMemoryStatus.NotRunning;
         memoryReadObject.PlayingTime = 0;
         memoryReadObject.ProcessId = 0;
@@ -435,7 +439,7 @@ public class MemoryScan
                         var commentIndex = span.IndexOf('#');
                         var validSpan = commentIndex == -1 ? span : span.Slice(0, commentIndex).TrimEnd();
 
-                        var splitterIndex = span.IndexOf('=');
+                        var splitterIndex = validSpan.IndexOf('=');
                         if (splitterIndex == -1) continue;
 
                         var key = validSpan.Slice(0, splitterIndex).TrimEnd();
@@ -476,13 +480,34 @@ public class MemoryScan
             _memoryContext!.BeginUpdate();
             _memoryContext.Populate(_osuMemoryData);
 
-            memoryReadObject.OsuStatus = (OsuMemoryStatus)_osuMemoryData.RawStatus;
+            var status = (OsuMemoryStatus)_osuMemoryData.RawStatus;
+            // Update metadata (PlayerName, Mods, IsReplay, BeatmapIdentifier) before OsuStatus
+            // so PlayingState.EnterAsync observes the current beatmap and mods immediately.
             memoryReadObject.PlayerName = _osuMemoryData.Username;
             memoryReadObject.Mods = (Mods)_osuMemoryData.Mods;
+            // Populate retains previous values when a read fails. Only use the current replay flag.
+            memoryReadObject.IsReplay = status == OsuMemoryStatus.Playing &&
+                                       _memoryContext.TryGetValueDef<byte>(_isReplayValueDefinition, out var replayFlag) &&
+                                       replayFlag == 1;
 
-            if (memoryReadObject.OsuStatus == OsuMemoryStatus.Playing)
+            if (_songsDirectory != null)
             {
-                memoryReadObject.IsReplay = _osuMemoryData.IsReplay;
+                var folderName = _osuMemoryData.FolderName;
+                var osuFileName = _osuMemoryData.OsuFileName;
+
+                if (!string.IsNullOrEmpty(osuFileName) &&
+                    (memoryReadObject.BeatmapIdentifier.Filename != osuFileName || _folderName != folderName))
+                {
+                    _folderName = folderName;
+                    var directory = Path.Combine(_songsDirectory, folderName);
+                    memoryReadObject.BeatmapIdentifier = new BeatmapIdentifier(directory, osuFileName);
+                }
+            }
+
+            memoryReadObject.OsuStatus = status;
+
+            if (status == OsuMemoryStatus.Playing)
+            {
                 var score = _osuMemoryData.Score;
 
                 if (_scoreProcessorValueDefinition != null &&
@@ -502,26 +527,6 @@ public class MemoryScan
             {
                 memoryReadObject.Score = 0;
                 memoryReadObject.Combo = 0;
-            }
-
-            if (_songsDirectory != null)
-            {
-                var folderName = _osuMemoryData.FolderName;
-                var osuFileName = _osuMemoryData.OsuFileName;
-
-                if (string.IsNullOrEmpty(osuFileName))
-                {
-                    return true;
-                }
-
-                if (memoryReadObject.BeatmapIdentifier.Filename == osuFileName && _folderName == folderName)
-                {
-                    return true;
-                }
-
-                _folderName = folderName;
-                var directory = Path.Combine(_songsDirectory, folderName);
-                memoryReadObject.BeatmapIdentifier = new BeatmapIdentifier(directory, osuFileName);
             }
 
             return true;

@@ -23,11 +23,14 @@ public class GameplaySessionManager
     public event SignalEventHandler? SessionStopped;
 
     private readonly Dictionary<GameMode, IHitsoundSequencer> _audioProviderDictionary = new();
-    private OsuFile? _osuFile;
-    private IHitsoundSequencer? _cachedHitsoundSequencer;
+    private readonly Lock _sessionLock = new();
+    private long _sessionVersion;
+    private volatile OsuFile? _osuFile;
+    private volatile IHitsoundSequencer? _cachedHitsoundSequencer;
     private string? _lastCachedFolder;
     private GCLatencyMode _oldLatencyMode;
     private bool _isLowLatencyModeActive;
+    private bool _hasActiveSession;
 
     public GameplaySessionManager(ILogger<GameplaySessionManager> logger,
         GameplayAudioService gameplayAudioService,
@@ -81,24 +84,27 @@ public class GameplaySessionManager
     {
         if (_audioProviderDictionary.Count == 0) return;
 
-        if (_osuFile == null)
-        {
-            _cachedHitsoundSequencer = _audioProviderDictionary[GameMode.Circle];
-        }
-        else
-        {
-            _cachedHitsoundSequencer = _audioProviderDictionary.TryGetValue(_osuFile.General.Mode, out var sequencer)
-                ? sequencer
-                : _audioProviderDictionary[GameMode.Circle];
-        }
+        _cachedHitsoundSequencer = GetSequencer(_osuFile?.General?.Mode ?? GameMode.Circle);
     }
+
+    private IHitsoundSequencer GetSequencer(GameMode mode) =>
+        _audioProviderDictionary.TryGetValue(mode, out var sequencer)
+            ? sequencer
+            : _audioProviderDictionary[GameMode.Circle];
 
     public async Task StartAsync(string? beatmapFilenameFull, string? beatmapFilename)
     {
+        long version;
+        lock (_sessionLock)
+        {
+            version = ++_sessionVersion;
+            _syncSessionContext.IsStarted = false;
+            OsuFile = null;
+        }
+
         try
         {
             _logger.LogInformation("Start playing.");
-            OsuFile = null;
 
             var resourceCatalog = _syncSessionContext.BeatmapResourceCatalog;
             var folder = ResolveBeatmapFolder(beatmapFilenameFull, beatmapFilename, resourceCatalog);
@@ -112,38 +118,56 @@ public class GameplaySessionManager
                 throw new ArgumentNullException(nameof(beatmapFilename), "Beatmap filename cannot be null.");
             }
 
-            var osuFile = await _beatmapHitsoundLoader.InitializeNodeListsAsync(folder, beatmapFilename,
-                CurrentHitsoundSequencer, _syncSessionContext.PlayMods, resourceCatalog);
-            OsuFile = osuFile;
-            AudioFilename = osuFile?.General?.AudioFilename;
-            BeatmapFolder = folder;
+            var loaded = await _beatmapHitsoundLoader.LoadHitsoundNodesAsync(
+                folder, beatmapFilename, _syncSessionContext.PlayMods, resourceCatalog);
+            if (loaded is not { } hitsounds) return;
 
             var cacheContextKey = resourceCatalog != null
                 ? $"{resourceCatalog.CacheKey}|{beatmapFilename}"
                 : folder;
 
-            PerformCache(folder, AudioFilename, resourceCatalog, cacheContextKey);
-            //ResetNodes(_syncSessionContext.PlayTime);
-
-            _syncSessionContext.IsStarted = true;
-
-            _oldLatencyMode = GCSettings.LatencyMode;
-            if (!RuntimeInfo.IsSatori)
+            lock (_sessionLock)
             {
-                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
-                _logger.LogInformation("GC LatencyMode set to SustainedLowLatency");
-            }
-            else
-            {
-                GCSettings.LatencyMode = GCLatencyMode.LowLatency;
-                _logger.LogInformation("GC LatencyMode set to LowLatency (Satori)");
-            }
+                if (version != _sessionVersion) return;
 
-            _isLowLatencyModeActive = true;
+                var sequencer = GetSequencer(hitsounds.Beatmap.General?.Mode ?? GameMode.Circle);
+                _beatmapHitsoundLoader.SetNodeLists(sequencer, hitsounds.Events);
+                OsuFile = hitsounds.Beatmap;
+                AudioFilename = hitsounds.Beatmap.General?.AudioFilename;
+                BeatmapFolder = folder;
+
+                var playTime = _syncSessionContext.PlayTime;
+                sequencer.SeekTo(playTime);
+                PrepareAudioContext(folder, AudioFilename, resourceCatalog, cacheContextKey);
+
+                if (!_isLowLatencyModeActive)
+                {
+                    _oldLatencyMode = GCSettings.LatencyMode;
+                    GCSettings.LatencyMode = RuntimeInfo.IsSatori
+                        ? GCLatencyMode.LowLatency
+                        : GCLatencyMode.SustainedLowLatency;
+                    _isLowLatencyModeActive = true;
+                    _logger.LogInformation("GC LatencyMode set to {Mode}", GCSettings.LatencyMode);
+                }
+
+                _hasActiveSession = true;
+                _syncSessionContext.IsStarted = true;
+                // Prime hitsounds first so initial notes are cached immediately, then precache music/skin.
+                _beatmapHitsoundLoader.PrimeCachingWindow(playTime);
+                if (_audioEngine.CurrentDevice != null)
+                {
+                    _gameplayAudioService.PrecacheMusicAndSkinInBackground();
+                }
+            }
         }
         catch (Exception ex)
         {
-            _syncSessionContext.IsStarted = false;
+            lock (_sessionLock)
+            {
+                if (version != _sessionVersion) return;
+                _syncSessionContext.IsStarted = false;
+            }
+
             _logger.LogError(ex, "Error while starting a beatmap. Filename: {BeatmapFilename}. FilenameReal: {OsuFile}",
                 beatmapFilename, OsuFile);
         }
@@ -162,7 +186,7 @@ public class GameplaySessionManager
             : resourceCatalog?.RootPath;
     }
 
-    private void PerformCache(string newFolder, string? audioFilename, IBeatmapResourceCatalog? resourceCatalog,
+    private void PrepareAudioContext(string newFolder, string? audioFilename, IBeatmapResourceCatalog? resourceCatalog,
         string cacheContextKey)
     {
         if (_lastCachedFolder != null && _lastCachedFolder != cacheContextKey)
@@ -180,32 +204,53 @@ public class GameplaySessionManager
         }
 
         _gameplayAudioService.SetContext(newFolder, audioFilename, resourceCatalog);
-        _gameplayAudioService.PrecacheMusicAndSkinInBackground();
     }
 
     public void Stop()
     {
-        if (_isLowLatencyModeActive)
+        long version;
+        bool wasActive;
+        lock (_sessionLock)
         {
-            GCSettings.LatencyMode = _oldLatencyMode;
-            _isLowLatencyModeActive = false;
-            _logger.LogInformation("GC LatencyMode restored to {Mode}", _oldLatencyMode);
+            version = ++_sessionVersion;
+            wasActive = _hasActiveSession || _syncSessionContext.IsStarted || _isLowLatencyModeActive;
+            _hasActiveSession = false;
+            _syncSessionContext.IsStarted = false;
+            if (_isLowLatencyModeActive)
+            {
+                GCSettings.LatencyMode = _oldLatencyMode;
+                _isLowLatencyModeActive = false;
+                _logger.LogInformation("GC LatencyMode restored to {Mode}", _oldLatencyMode);
+            }
+
+            if (wasActive)
+            {
+                _logger.LogInformation("Stop playing.");
+            }
+
+            var mixer = _audioEngine.EffectMixer;
+            _sfxPlaybackService.ClearAllLoops(mixer);
+            mixer?.RemoveAllMixerInputs();
         }
 
-        _logger.LogInformation("Stop playing.");
-        _syncSessionContext.IsStarted = false;
-        var mixer = _audioEngine.EffectMixer;
-        _sfxPlaybackService.ClearAllLoops(mixer);
-        mixer?.RemoveAllMixerInputs();
+        if (wasActive)
+        {
+            SessionStopped?.Invoke();
+        }
 
-        SessionStopped?.Invoke();
-
-        _syncSessionContext.BaseMemoryTime = 0;
-        _syncSessionContext.Combo = 0;
+        lock (_sessionLock)
+        {
+            if (version != _sessionVersion) return;
+            _syncSessionContext.BaseMemoryTime = 0;
+            _syncSessionContext.Combo = 0;
+        }
     }
 
-    private void ResetNodes(int playTime)
+    internal void InvalidatePendingStart()
     {
-        _beatmapHitsoundLoader.ResetNodes(CurrentHitsoundSequencer, playTime);
+        lock (_sessionLock)
+        {
+            _sessionVersion++;
+        }
     }
 }

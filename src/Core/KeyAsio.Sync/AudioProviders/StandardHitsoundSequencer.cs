@@ -3,6 +3,7 @@ using KeyAsio.Configuration;
 using KeyAsio.Configuration.Models;
 using KeyAsio.Core.Audio;
 using KeyAsio.Core.OsuAudio.Hitsounds.Playback;
+using KeyAsio.Sync.Abstractions;
 using KeyAsio.Sync.Models;
 using KeyAsio.Sync.Services;
 using Microsoft.Extensions.Logging;
@@ -16,9 +17,11 @@ public class StandardHitsoundSequencer : IHitsoundSequencer
     private readonly ILogger<StandardHitsoundSequencer> _logger;
     private readonly AppSettings _appSettings;
     private readonly SyncSessionContext _syncSessionContext;
+    private readonly IPlaybackRuntimeState? _runtimeState;
     private readonly IPlaybackEngine _playbackEngine;
     private readonly GameplayAudioService _gameplayAudioService;
     private readonly GameplaySessionManager _gameplaySessionManager;
+    private readonly Lock _queueLock = new();
 
     private Queue<SampleEvent> _hitQueue = new();
     private Queue<PlaybackEvent> _playbackQueue = new();
@@ -28,11 +31,13 @@ public class StandardHitsoundSequencer : IHitsoundSequencer
         SyncSessionContext syncSessionContext,
         IPlaybackEngine playbackEngine,
         GameplayAudioService gameplayAudioService,
-        GameplaySessionManager gameplaySessionManager)
+        GameplaySessionManager gameplaySessionManager,
+        IPlaybackRuntimeState? runtimeState = null)
     {
         _logger = logger;
         _appSettings = appSettings;
         _syncSessionContext = syncSessionContext;
+        _runtimeState = runtimeState;
         _playbackEngine = playbackEngine;
         _gameplayAudioService = gameplayAudioService;
         _gameplaySessionManager = gameplaySessionManager;
@@ -42,45 +47,52 @@ public class StandardHitsoundSequencer : IHitsoundSequencer
 
     public void SeekTo(int playTime)
     {
-        _hitQueue = new Queue<SampleEvent>(
-            _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
-        );
-        _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
-            .Where(k => k.Offset >= playTime));
+        lock (_queueLock)
+        {
+            _hitQueue = new Queue<SampleEvent>(
+                _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
+            );
+            _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
+                .Where(k => k.Offset >= playTime));
+        }
     }
 
     public void ProcessAutoPlay(List<PlaybackInfo> buffer, bool processHitQueueAsAuto)
     {
         if (!IsEngineReady()) return;
 
-        var first = processHitQueueAsAuto
-            ? (_playbackQueue.TryPeek(out var pNode) ? pNode : null)
-            : (_hitQueue.TryPeek(out var hNode) ? hNode : null);
+        lock (_queueLock)
+        {
+            var first = processHitQueueAsAuto
+                ? (_playbackQueue.TryPeek(out var pNode) ? pNode : null)
+                : (_hitQueue.TryPeek(out var hNode) ? hNode : null);
 
-        if (first == null)
-        {
-            return;
-        }
+            if (first == null)
+            {
+                return;
+            }
 
-        var playTime = _syncSessionContext.PlayTime;
-        if (playTime < first.Offset)
-        {
-            return;
-        }
+            var playTime = _syncSessionContext.PlayTime;
+            if (playTime < first.Offset)
+            {
+                return;
+            }
 
-        // 如果需要，将 HitQueue 当作自动播放处理（例如回放模式或 Auto 模式）
-        if (processHitQueueAsAuto)
-        {
-            ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
-        }
-        else
-        {
-            ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+            // 如果需要，将 HitQueue 当作自动播放处理（例如回放模式或 Auto 模式）
+            if (processHitQueueAsAuto)
+            {
+                ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
+            }
+            else
+            {
+                ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+            }
         }
     }
 
     public void ProcessInteraction(List<PlaybackInfo> buffer, int keyIndex, int keyTotal)
     {
+        if (_syncSessionContext.ShouldAutoPlayHitsounds(_runtimeState?.AutoMode ?? false)) return;
         if (!IsEngineReady()) return;
 
         var playTime = _syncSessionContext.PlayTime;
@@ -89,64 +101,67 @@ public class StandardHitsoundSequencer : IHitsoundSequencer
         bool hasHit = false;
         Guid? currentGroupGuid = null;
 
-        // 循环处理队列，直到：
-        // 1. 队列空了
-        // 2. 判定太早（Early Reject）
-        // 3. 判定命中（Hit）并处理完该组所有音符
-        while (_hitQueue.TryPeek(out var node))
+        lock (_queueLock)
         {
-            // 计算时间差
-            // diff > 0: 此时刻在音符之后 (Late)
-            // diff < 0: 此时刻在音符之前 (Early)
-            var diff = playTime - node.Offset;
-
-            // --- 情况 1: 已经命中过，正在处理同组音符 (Chord) ---
-            if (hasHit)
+            // 循环处理队列，直到：
+            // 1. 队列空了
+            // 2. 判定太早（Early Reject）
+            // 3. 判定命中（Hit）并处理完该组所有音符
+            while (_hitQueue.TryPeek(out var node))
             {
-                // 如果 GUID 变了，说明这一组（Chord）处理完了，停止
-                if (node.Guid != currentGroupGuid)
+                // 计算时间差
+                // diff > 0: 此时刻在音符之后 (Late)
+                // diff < 0: 此时刻在音符之前 (Early)
+                var diff = playTime - node.Offset;
+
+                // --- 情况 1: 已经命中过，正在处理同组音符 (Chord) ---
+                if (hasHit)
                 {
+                    // 如果 GUID 变了，说明这一组（Chord）处理完了，停止
+                    if (node.Guid != currentGroupGuid)
+                    {
+                        return;
+                    }
+
+                    // 同组音符，直接播放，不需要再判定时间
+                    DequeueAndPlay(buffer, _hitQueue);
+                    continue;
+                }
+
+                // --- 情况 2: 音符已彻底过期 (Missed) ---
+                // 例如：当前 1500ms，音符 1000ms，阈值 100ms。
+                // 1500 > 1000 + 100 -> 过期。
+                if (diff > KeyThresholdMilliseconds)
+                {
+                    //_logger.LogDebug("Pruning expired node at {Offset} (Current: {PlayTime})", node.Offset, playTime);
+                    _hitQueue.Dequeue(); // 移除过期音符
+                    continue; // 【关键修复】：不返回，继续用当次点击去检查下一个音符！
+                }
+
+                // --- 情况 3: 点击太早 (Too Early) ---
+                // 例如：当前 800ms，音符 1000ms，阈值 100ms。
+                // 800 < 1000 - 100 -> 太早。
+                if (diff < -KeyThresholdMilliseconds)
+                {
+                    // 还没到判定窗口，且因为队列是有序的，后面的肯定也更早。
+                    // 停止处理，等待时间流逝。
                     return;
                 }
 
-                // 同组音符，直接播放，不需要再判定时间
+                // --- 情况 4: 命中判定窗口 (Hit) ---
+                // 代码能走到这，说明：Offset - Threshold <= playTime <= Offset + Threshold
+
+                //_logger.LogDebug("Hit node at {Offset} (Current: {PlayTime})", node.Offset, playTime);
+
+                // 记录状态，标记为已命中
+                hasHit = true;
+                currentGroupGuid = node.Guid;
+
+                // 播放并移除
                 DequeueAndPlay(buffer, _hitQueue);
-                continue;
+
+                // 循环继续，去检查是否还有同 GUID 的重叠音符
             }
-
-            // --- 情况 2: 音符已彻底过期 (Missed) ---
-            // 例如：当前 1500ms，音符 1000ms，阈值 100ms。
-            // 1500 > 1000 + 100 -> 过期。
-            if (diff > KeyThresholdMilliseconds)
-            {
-                //_logger.LogDebug("Pruning expired node at {Offset} (Current: {PlayTime})", node.Offset, playTime);
-                _hitQueue.Dequeue(); // 移除过期音符
-                continue; // 【关键修复】：不返回，继续用当次点击去检查下一个音符！
-            }
-
-            // --- 情况 3: 点击太早 (Too Early) ---
-            // 例如：当前 800ms，音符 1000ms，阈值 100ms。
-            // 800 < 1000 - 100 -> 太早。
-            if (diff < -KeyThresholdMilliseconds)
-            {
-                // 还没到判定窗口，且因为队列是有序的，后面的肯定也更早。
-                // 停止处理，等待时间流逝。
-                return;
-            }
-
-            // --- 情况 4: 命中判定窗口 (Hit) ---
-            // 代码能走到这，说明：Offset - Threshold <= playTime <= Offset + Threshold
-
-            //_logger.LogDebug("Hit node at {Offset} (Current: {PlayTime})", node.Offset, playTime);
-
-            // 记录状态，标记为已命中
-            hasHit = true;
-            currentGroupGuid = node.Guid;
-
-            // 播放并移除
-            DequeueAndPlay(buffer, _hitQueue);
-
-            // 循环继续，去检查是否还有同 GUID 的重叠音符
         }
     }
 

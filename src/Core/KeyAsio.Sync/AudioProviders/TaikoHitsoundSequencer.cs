@@ -5,6 +5,7 @@ using KeyAsio.Configuration.Models;
 using KeyAsio.Core.Audio;
 using KeyAsio.Core.Audio.Caching;
 using KeyAsio.Core.OsuAudio.Hitsounds.Playback;
+using KeyAsio.Sync.Abstractions;
 using KeyAsio.Sync.Models;
 using KeyAsio.Sync.Services;
 using Microsoft.Extensions.Logging;
@@ -18,9 +19,11 @@ public class TaikoHitsoundSequencer : IHitsoundSequencer
     private readonly ILogger<TaikoHitsoundSequencer> _logger;
     private readonly AppSettings _appSettings;
     private readonly SyncSessionContext _syncSessionContext;
+    private readonly IPlaybackRuntimeState? _runtimeState;
     private readonly IPlaybackEngine _playbackEngine;
     private readonly GameplayAudioService _gameplayAudioService;
     private readonly GameplaySessionManager _gameplaySessionManager;
+    private readonly Lock _queueLock = new();
 
     private Queue<SampleEvent> _hitQueue = new();
     private Queue<PlaybackEvent> _playbackQueue = new();
@@ -34,11 +37,13 @@ public class TaikoHitsoundSequencer : IHitsoundSequencer
         SyncSessionContext syncSessionContext,
         IPlaybackEngine playbackEngine,
         GameplayAudioService gameplayAudioService,
-        GameplaySessionManager gameplaySessionManager)
+        GameplaySessionManager gameplaySessionManager,
+        IPlaybackRuntimeState? runtimeState = null)
     {
         _logger = logger;
         _appSettings = appSettings;
         _syncSessionContext = syncSessionContext;
+        _runtimeState = runtimeState;
         _playbackEngine = playbackEngine;
         _gameplayAudioService = gameplayAudioService;
         _gameplaySessionManager = gameplaySessionManager;
@@ -48,45 +53,52 @@ public class TaikoHitsoundSequencer : IHitsoundSequencer
 
     public void SeekTo(int playTime)
     {
-        _hitQueue = new Queue<SampleEvent>(
-            _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
-        );
-        _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
-            .Where(k => k.Offset >= playTime));
+        lock (_queueLock)
+        {
+            _hitQueue = new Queue<SampleEvent>(
+                _gameplaySessionManager.KeyList.Where(k => k.Offset >= playTime - KeyThresholdMilliseconds)
+            );
+            _playbackQueue = new Queue<PlaybackEvent>(_gameplaySessionManager.PlaybackList
+                .Where(k => k.Offset >= playTime));
+        }
     }
 
     public void ProcessAutoPlay(List<PlaybackInfo> buffer, bool processHitQueueAsAuto)
     {
         if (!IsEngineReady()) return;
 
-        var first = processHitQueueAsAuto
-            ? (_playbackQueue.TryPeek(out var pNode) ? pNode : null)
-            : (_hitQueue.TryPeek(out var hNode) ? hNode : null);
+        lock (_queueLock)
+        {
+            var first = processHitQueueAsAuto
+                ? (_playbackQueue.TryPeek(out var pNode) ? pNode : null)
+                : (_hitQueue.TryPeek(out var hNode) ? hNode : null);
 
-        if (first == null)
-        {
-            return;
-        }
+            if (first == null)
+            {
+                return;
+            }
 
-        var playTime = _syncSessionContext.PlayTime;
-        if (playTime < first.Offset)
-        {
-            return;
-        }
+            var playTime = _syncSessionContext.PlayTime;
+            if (playTime < first.Offset)
+            {
+                return;
+            }
 
-        // 如果需要，将 HitQueue 当作自动播放处理（例如回放模式或 Auto 模式）
-        if (processHitQueueAsAuto)
-        {
-            ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
-        }
-        else
-        {
-            ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+            // 如果需要，将 HitQueue 当作自动播放处理（例如回放模式或 Auto 模式）
+            if (processHitQueueAsAuto)
+            {
+                ProcessTimeBasedQueue(buffer, _playbackQueue, playTime);
+            }
+            else
+            {
+                ProcessTimeBasedQueue(buffer, _hitQueue, playTime);
+            }
         }
     }
 
     public void ProcessInteraction(List<PlaybackInfo> buffer, int keyIndex, int keyTotal)
     {
+        if (_syncSessionContext.ShouldAutoPlayHitsounds(_runtimeState?.AutoMode ?? false)) return;
         if (!IsEngineReady()) return;
 
         var playTime = _syncSessionContext.PlayTime;
@@ -104,112 +116,115 @@ public class TaikoHitsoundSequencer : IHitsoundSequencer
         bool isDonInput = keyIndex == 1 || keyIndex == 2;
         bool isKatInput = keyIndex == 0 || keyIndex == 3;
 
-        // 获取参考 Note 用于空打音效
-        PlaybackEvent? refNode = null;
-
-        if (_hitQueue.TryPeek(out var headNode))
+        lock (_queueLock)
         {
-            refNode = headNode;
-        }
-        else if (_playbackQueue.TryPeek(out var pbNode))
-        {
-            refNode = pbNode;
-        }
+            // 获取参考 Note 用于空打音效
+            PlaybackEvent? refNode = null;
 
-        bool soundPlayed = false;
-
-        // 借用 mania 的逻辑来处理 Taiko 的判定，Chord 实际上不应存在
-
-        // 循环处理队列，直到：
-        // 1. 队列空了
-        // 2. 判定太早（Early Reject）
-        // 3. 判定命中（Hit）并处理完该组所有音符
-        while (_hitQueue.TryPeek(out var node))
-        {
-            // 计算时间差
-            // diff > 0: 此时刻在音符之后 (Late)
-            // diff < 0: 此时刻在音符之前 (Early)
-            var diff = playTime - node.Offset;
-
-            // --- 情况 1: 已经命中过，正在处理同组音符 (Chord) ---
-            if (hasHit)
+            if (_hitQueue.TryPeek(out var headNode))
             {
-                // 如果 GUID 变了，说明这一组（Chord）处理完了，停止
-                if (node.Guid != currentGroupGuid)
+                refNode = headNode;
+            }
+            else if (_playbackQueue.TryPeek(out var pbNode))
+            {
+                refNode = pbNode;
+            }
+
+            bool soundPlayed = false;
+
+            // 借用 mania 的逻辑来处理 Taiko 的判定，Chord 实际上不应存在
+
+            // 循环处理队列，直到：
+            // 1. 队列空了
+            // 2. 判定太早（Early Reject）
+            // 3. 判定命中（Hit）并处理完该组所有音符
+            while (_hitQueue.TryPeek(out var node))
+            {
+                // 计算时间差
+                // diff > 0: 此时刻在音符之后 (Late)
+                // diff < 0: 此时刻在音符之前 (Early)
+                var diff = playTime - node.Offset;
+
+                // --- 情况 1: 已经命中过，正在处理同组音符 (Chord) ---
+                if (hasHit)
                 {
-                    return;
+                    // 如果 GUID 变了，说明这一组（Chord）处理完了，停止
+                    if (node.Guid != currentGroupGuid)
+                    {
+                        return;
+                    }
+
+                    DequeueAndPlay(buffer, _hitQueue);
+                    continue;
                 }
 
-                DequeueAndPlay(buffer, _hitQueue);
-                continue;
-            }
-
-            // --- 情况 2: 音符已彻底过期 (Missed) ---
-            if (diff > KeyThresholdMilliseconds)
-            {
-                _hitQueue.Dequeue(); // 移除过期音符
-                // 更新参考 Note
-                if (_hitQueue.TryPeek(out var nextNode)) refNode = nextNode;
-                continue;
-            }
-
-            // --- 情况 3: 点击太早 (Too Early) ---
-            if (diff < -KeyThresholdMilliseconds)
-            {
-                break;
-            }
-
-            // --- 情况 4: 命中判定窗口 (Hit) ---
-
-            // Check Note Type
-            // Filename check is a heuristic
-            var filename = node.Filename ?? "";
-            bool isKatNode = filename.Contains("clap", StringComparison.OrdinalIgnoreCase) ||
-                             filename.Contains("whistle", StringComparison.OrdinalIgnoreCase);
-            bool isDonNode = !isKatNode;
-
-            bool typeMatch = (isDonInput && isDonNode) || (isKatInput && isKatNode);
-
-            if (typeMatch)
-            {
-                // 记录状态，标记为已命中
-                hasHit = true;
-                currentGroupGuid = node.Guid;
-
-                // 播放并移除
-                if (ShouldPlaySound(isDonInput))
+                // --- 情况 2: 音符已彻底过期 (Missed) ---
+                if (diff > KeyThresholdMilliseconds)
                 {
-                    DequeueAndPlay(buffer, _hitQueue);
-                    UpdateLastPlayTime(isDonInput);
-                    soundPlayed = true;
+                    _hitQueue.Dequeue(); // 移除过期音符
+                    // 更新参考 Note
+                    if (_hitQueue.TryPeek(out var nextNode)) refNode = nextNode;
+                    continue;
+                }
+
+                // --- 情况 3: 点击太早 (Too Early) ---
+                if (diff < -KeyThresholdMilliseconds)
+                {
+                    break;
+                }
+
+                // --- 情况 4: 命中判定窗口 (Hit) ---
+
+                // Check Note Type
+                // Filename check is a heuristic
+                var filename = node.Filename ?? "";
+                bool isKatNode = filename.Contains("clap", StringComparison.OrdinalIgnoreCase) ||
+                                 filename.Contains("whistle", StringComparison.OrdinalIgnoreCase);
+                bool isDonNode = !isKatNode;
+
+                bool typeMatch = (isDonInput && isDonNode) || (isKatInput && isKatNode);
+
+                if (typeMatch)
+                {
+                    // 记录状态，标记为已命中
+                    hasHit = true;
+                    currentGroupGuid = node.Guid;
+
+                    // 播放并移除
+                    if (ShouldPlaySound(isDonInput))
+                    {
+                        DequeueAndPlay(buffer, _hitQueue);
+                        UpdateLastPlayTime(isDonInput);
+                        soundPlayed = true;
+                    }
+                    else
+                    {
+                        // 防抖生效：只移除不播放
+                        _hitQueue.Dequeue();
+                        soundPlayed = true; // 视为已处理，避免触发后续空打逻辑
+                    }
                 }
                 else
                 {
-                    // 防抖生效：只移除不播放
+                    // 类型不匹配
+                    // 消耗掉音符，不播放。
                     _hitQueue.Dequeue();
-                    soundPlayed = true; // 视为已处理，避免触发后续空打逻辑
+                    refNode = node; // 使用这个 Miss 的 Note 作为空打声音的参考
+
+                    // 既然这次点击消耗了这个音符（判定为 Miss），那么我们就不能再用这次点击去匹配其他音符了。
+                    break;
                 }
             }
-            else
-            {
-                // 类型不匹配
-                // 消耗掉音符，不播放。
-                _hitQueue.Dequeue();
-                refNode = node; // 使用这个 Miss 的 Note 作为空打声音的参考
 
-                // 既然这次点击消耗了这个音符（判定为 Miss），那么我们就不能再用这次点击去匹配其他音符了。
-                break;
-            }
-        }
-
-        if (!soundPlayed && refNode != null)
-        {
-            if (ShouldPlaySound(isDonInput))
+            if (!soundPlayed && refNode != null)
             {
-                if (GetFallbackAudio(refNode, isDonInput, out var cachedAudio))
+                if (ShouldPlaySound(isDonInput))
                 {
-                    buffer.Add(new PlaybackInfo(cachedAudio!, refNode));
-                    UpdateLastPlayTime(isDonInput);
+                    if (GetFallbackAudio(refNode, isDonInput, out var cachedAudio))
+                    {
+                        buffer.Add(new PlaybackInfo(cachedAudio!, refNode));
+                        UpdateLastPlayTime(isDonInput);
+                    }
                 }
             }
         }

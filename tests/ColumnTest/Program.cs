@@ -41,7 +41,8 @@ var hitsoundList = await osuDir.GetHitsoundNodesAsync(osuFile);
 var logger = provider.GetRequiredService<ILogger<ManiaHitsoundSequencer>>();
 var cacheService = provider.GetRequiredService<GameplayAudioService>();
 var playSession = provider.GetRequiredService<GameplaySessionManager>();
-var maniaAudioProvider = new ManiaHitsoundSequencer(logger, appSettings, realtimeProperties, audioEngine, cacheService, playSession);
+var maniaAudioProvider = new ManiaHitsoundSequencer(logger, appSettings, realtimeProperties,
+    provider.GetRequiredService<ApplicationState>(), audioEngine, cacheService, playSession);
 
 List<SampleEvent> keyList = new();
 List<PlaybackEvent> playbackList = new();

@@ -32,7 +32,6 @@ public record OsuMemoryData
     public string Username { get; set; } = string.Empty;
 
     //public string SkinFolder { get; set; } = string.Empty;
-    public bool IsReplay { get; set; }
     public int Score { get; set; }
     public ushort Combo { get; set; }
 }

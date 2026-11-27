@@ -24,6 +24,7 @@ public class SyncSessionContext
     private long _anchorTick; // 锚点 Tick
     private int _anchorTime; // 锚点时间 (ms)
     private double _playbackRate = 1.0;
+    private volatile bool _isStarted;
     private static readonly double s_tickToMs = 1000.0 / Stopwatch.Frequency;
 
     // 音频同步与防倒退
@@ -42,8 +43,18 @@ public class SyncSessionContext
     }
 
     public GameClientType ClientType { get; set; }
-    public bool IsStarted { get; set; }
+    public bool IsStarted
+    {
+        get => _isStarted;
+        set => _isStarted = value;
+    }
     public bool IsReplay { get; set; }
+
+    internal double PlaybackRate => _playbackRate;
+
+    internal bool ShouldAutoPlayHitsounds(bool autoMode)
+        => autoMode || IsReplay ||
+           (PlayMods != Mods.Unknown && (PlayMods & (Mods.Autoplay | Mods.Cinema | Mods.Relax)) != 0);
 
     /// <summary>
     /// 音频是否处于暂停/冻结状态。
@@ -85,7 +96,9 @@ public class SyncSessionContext
     {
         var oldRate = _playbackRate;
 
-        if (mods.HasFlag(Mods.DoubleTime) || mods.HasFlag(Mods.Nightcore))
+        if (mods == Mods.Unknown)
+            _playbackRate = 1.0;
+        else if (mods.HasFlag(Mods.DoubleTime) || mods.HasFlag(Mods.Nightcore))
             _playbackRate = 1.5;
         else if (mods.HasFlag(Mods.HalfTime))
             _playbackRate = 0.75;

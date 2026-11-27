@@ -37,6 +37,7 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
     private IBeatmapResourceCatalog? _beatmapResourceCatalog;
 
     private readonly AsyncSequentialWorker _cachingWorker;
+    private readonly AsyncSequentialWorker _musicCachingWorker;
     private readonly AsyncSequentialWorker _skinCachingWorker;
 
     public GameplayAudioService(ILogger<GameplayAudioService> logger,
@@ -56,6 +57,7 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         _skinResources = skinResources;
 
         _cachingWorker = new AsyncSequentialWorker(_logger, "GameplayAudioServiceWorker");
+        _musicCachingWorker = new AsyncSequentialWorker(_logger, "GameplayMusicAudioServiceWorker");
         _skinCachingWorker = new AsyncSequentialWorker(_logger, "GameplaySkinAudioServiceWorker");
         _runtimeState.SelectedSkinChanged += OnSelectedSkinChanged;
         _skinResources.ResourcesChanged += OnSkinResourcesChanged;
@@ -116,15 +118,16 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         }
 
         var folder = _beatmapFolder;
+        var audioFilename = _audioFilename;
         var waveFormat = _playbackEngine.EngineWaveFormat;
 
         PrecacheSkinInBackground(invalidateExisting: false);
 
-        _cachingWorker.Enqueue(async token =>
+        _musicCachingWorker.Enqueue(async token =>
         {
-            if (folder != null && _audioFilename != null)
+            if (folder != null && audioFilename != null)
             {
-                var musicPath = ResolveBeatmapFilePath(folder, _audioFilename);
+                var musicPath = ResolveBeatmapFilePath(folder, audioFilename);
 
                 var (_, status) = await _audioCacheManager.GetOrCreateOrEmptyFromFileAsync(musicPath, waveFormat);
 
@@ -451,6 +454,7 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         _runtimeState.SelectedSkinChanged -= OnSelectedSkinChanged;
         _skinResources.ResourcesChanged -= OnSkinResourcesChanged;
         _cachingWorker.Dispose();
+        _musicCachingWorker.Dispose();
         _skinCachingWorker.Dispose();
     }
 }

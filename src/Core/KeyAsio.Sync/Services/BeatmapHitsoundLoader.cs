@@ -14,8 +14,8 @@ public class BeatmapHitsoundLoader
     private readonly AppSettings _appSettings;
     private readonly GameplayAudioService _gameplayAudioService;
 
-    private readonly List<SampleEvent> _keyList = new();
-    private readonly List<PlaybackEvent> _playbackList = new();
+    private List<SampleEvent> _keyList = new();
+    private List<PlaybackEvent> _playbackList = new();
     private int _nextCachingTime;
 
     public BeatmapHitsoundLoader(ILogger<BeatmapHitsoundLoader> logger, AppSettings appSettings,
@@ -29,12 +29,9 @@ public class BeatmapHitsoundLoader
     public IReadOnlyList<PlaybackEvent> PlaybackList => _playbackList;
     public List<SampleEvent> KeyList => _keyList;
 
-    public async Task<OsuFile?> InitializeNodeListsAsync(string folder, string diffFilename,
-        IHitsoundSequencer hitsoundSequencer, Mods playMods, IBeatmapResourceCatalog? resourceCatalog = null)
+    internal async Task<(OsuFile Beatmap, List<PlaybackEvent> Events)?> LoadHitsoundNodesAsync(
+        string folder, string diffFilename, Mods playMods, IBeatmapResourceCatalog? resourceCatalog)
     {
-        _keyList.Clear();
-        _playbackList.Clear();
-
         var beatmapSetContext = resourceCatalog != null
             ? new BeatmapSetContext(resourceCatalog)
             : new BeatmapSetContext(folder);
@@ -70,8 +67,16 @@ public class BeatmapHitsoundLoader
             hitsoundList = hitsoundList.OrderBy(k => k.Offset).ToList();
         }
 
-        hitsoundSequencer.FillAudioList(hitsoundList, _keyList, _playbackList);
-        return osuFile;
+        return (osuFile, hitsoundList);
+    }
+
+    internal void SetNodeLists(IHitsoundSequencer hitsoundSequencer, IReadOnlyList<PlaybackEvent> events)
+    {
+        var keyList = new List<SampleEvent>();
+        var playbackList = new List<PlaybackEvent>();
+        hitsoundSequencer.FillAudioList(events, keyList, playbackList);
+        _keyList = keyList;
+        _playbackList = playbackList;
     }
 
     public void CacheAllHitsounds()
@@ -83,9 +88,15 @@ public class BeatmapHitsoundLoader
     public void ResetNodes(IHitsoundSequencer hitsoundSequencer, int playTime)
     {
         hitsoundSequencer.SeekTo(playTime); // slow
-        _gameplayAudioService.PrecacheHitsoundsRangeInBackground(0, 13000, _keyList);
-        _gameplayAudioService.PrecacheHitsoundsRangeInBackground(0, 13000, _playbackList);
-        _nextCachingTime = 10000;
+        PrimeCachingWindow(playTime);
+    }
+
+    internal void PrimeCachingWindow(int playTime)
+    {
+        var startTime = Math.Max(0, playTime - 200);
+        _nextCachingTime = startTime + 10000;
+        _gameplayAudioService.PrecacheHitsoundsRangeInBackground(startTime, startTime + 13000, _keyList);
+        _gameplayAudioService.PrecacheHitsoundsRangeInBackground(startTime, startTime + 13000, _playbackList);
     }
 
     public void AdvanceCachingWindow(int newMs)

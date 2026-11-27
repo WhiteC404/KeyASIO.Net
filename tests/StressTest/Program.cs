@@ -100,6 +100,7 @@ public class Program
             loggerFactory.CreateLogger<KeyAsio.Sync.AudioProviders.ManiaHitsoundSequencer>(),
             provider.GetRequiredService<AppSettings>(),
             ctx,
+            provider.GetRequiredService<ApplicationState>(),
             audioEngine,
             gameplayAudioService,
             gameplaySessionManager
